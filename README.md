@@ -97,6 +97,16 @@ port_password   specify multiple ports and passwords to support multiple users
 
 Here's a sample configuration [`server-multi-port.json`](https://github.com/shadowsocks/shadowsocks-go/blob/master/sample-config/server-multi-port.json). Given `port_password`, server program will ignore `server_port` and `password` options.
 
+Now, you can specify multiple ports and passwords by using database, instead of configuare file. Use the following options on the server for such setup:
+```
+"port_password_db": {
+	"driver": "mysql",	// database type. now only support mysql, required
+	"dsn": "USER:PASSWORD@tcp(HOST:PORT)/DATABASE?charset=CHARSET",	// data source name, required
+	"select_sql": "select PORT, PASSWORD from sometable", // the sql statment that seaching activing port-passwords from database. it must have two columns. first port, second password. required
+	"check_interval": 60		// if given, the server will select from database every X seconds. Optional
+}
+```
+
 ### Update port password for a running server
 
 Edit the config file used to start the server, then send `SIGHUP` to the server process.
