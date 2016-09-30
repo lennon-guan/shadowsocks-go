@@ -27,8 +27,15 @@ type Config struct {
 	Auth       bool        `json:"auth"`   // one time auth
 
 	// following options are only used by server
-	PortPassword map[string]string `json:"port_password"`
-	Timeout      int               `json:"timeout"`
+	PortPassword   map[string]string `json:"port_password"`
+	Timeout        int               `json:"timeout"`
+	MgrAddr        string            `json:"mgr_addr"`
+	PortPasswordDB *struct {
+		Driver        string `json:"driver"`
+		Dsn           string `json:"dsn"`
+		SelectSQL     string `json:"select_sql"`
+		CheckInterval int    `json:"check_interval"`
+	} `json:"port_password_db"`
 
 	// following options are only used by client
 

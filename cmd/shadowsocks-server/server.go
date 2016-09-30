@@ -2,13 +2,16 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -16,7 +19,9 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
+	_ "github.com/go-sql-driver/mysql"
 	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
 )
 
@@ -171,8 +176,10 @@ func handleConnection(conn *ss.Conn, auth bool) {
 }
 
 type PortListener struct {
-	password string
-	listener net.Listener
+	password   string
+	listener   net.Listener
+	readBytes  uint64
+	writeBytes uint64
 }
 
 type PasswdManager struct {
@@ -182,7 +189,7 @@ type PasswdManager struct {
 
 func (pm *PasswdManager) add(port, password string, listener net.Listener) {
 	pm.Lock()
-	pm.portListener[port] = &PortListener{password, listener}
+	pm.portListener[port] = &PortListener{password, listener, uint64(0), uint64(0)}
 	pm.Unlock()
 }
 
@@ -267,6 +274,27 @@ func waitSignal() {
 	}
 }
 
+type statConn struct {
+	net.Conn
+	pl *PortListener
+}
+
+func (c *statConn) Read(b []byte) (n int, err error) {
+	n, err = c.Conn.Read(b)
+	if err == nil && n > 0 {
+		c.pl.readBytes += uint64(n)
+	}
+	return
+}
+
+func (c *statConn) Write(b []byte) (n int, err error) {
+	n, err = c.Conn.Write(b)
+	if err == nil && n > 0 {
+		c.pl.writeBytes += uint64(n)
+	}
+	return
+}
+
 func run(port, password string, auth bool) {
 	ln, err := net.Listen("tcp", ":"+port)
 	if err != nil {
@@ -293,7 +321,9 @@ func run(port, password string, auth bool) {
 				continue
 			}
 		}
-		go handleConnection(ss.NewConn(conn, cipher.Copy()), auth)
+		if pl, ok := passwdManager.get(port); ok {
+			go handleConnection(ss.NewConn(&statConn{Conn: conn, pl: pl}, cipher.Copy()), auth)
+		}
 	}
 }
 
@@ -301,8 +331,26 @@ func enoughOptions(config *ss.Config) bool {
 	return config.ServerPort != 0 && config.Password != ""
 }
 
+var db *sql.DB
+
 func unifyPortPassword(config *ss.Config) (err error) {
-	if len(config.PortPassword) == 0 { // this handles both nil PortPassword and empty one
+	if db != nil {
+		var rows *sql.Rows
+		if rows, err = db.Query(config.PortPasswordDB.SelectSQL); err != nil {
+			return
+		}
+		defer rows.Close()
+		config.PortPassword = make(map[string]string)
+		for rows.Next() {
+			var port, passwd string
+			err = rows.Scan(&port, &passwd)
+			if err != nil {
+				return
+			}
+			config.PortPassword[port] = passwd
+		}
+		return
+	} else if len(config.PortPassword) == 0 { // this handles both nil PortPassword and empty one
 		if !enoughOptions(config) {
 			fmt.Fprintln(os.Stderr, "must specify both port and password")
 			return errors.New("not enough options")
@@ -319,6 +367,41 @@ func unifyPortPassword(config *ss.Config) (err error) {
 
 var configFile string
 var config *ss.Config
+
+func runManager(mgrAddr string) {
+	http.HandleFunc("/add", func(w http.ResponseWriter, r *http.Request) {
+		port := r.FormValue("port")
+		passwd := r.FormValue("passwd")
+		config.PortPassword[port] = passwd
+		passwdManager.updatePortPasswd(port, passwd, config.Auth)
+		w.Write([]byte("OK"))
+	})
+	http.HandleFunc("/remove", func(w http.ResponseWriter, r *http.Request) {
+		port := r.FormValue("port")
+		passwdManager.del(port)
+		delete(config.PortPassword, port)
+		log.Printf("server port %s removed\n", port)
+		w.Write([]byte("OK"))
+	})
+	http.HandleFunc("/reload", func(w http.ResponseWriter, r *http.Request) {
+		updatePasswd()
+		w.Write([]byte("OK"))
+	})
+	http.HandleFunc("/stat", func(w http.ResponseWriter, r *http.Request) {
+		passwdManager.Lock()
+		defer passwdManager.Unlock()
+		m := make(map[string]interface{}, len(passwdManager.portListener))
+		for port, pl := range passwdManager.portListener {
+			m[port] = map[string]uint64{
+				"in":  pl.readBytes,
+				"out": pl.writeBytes,
+			}
+		}
+		out, _ := json.Marshal(m)
+		w.Write(out)
+	})
+	http.ListenAndServe(mgrAddr, nil)
+}
 
 func main() {
 	log.SetOutput(os.Stdout)
@@ -368,6 +451,20 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	if dbConf := config.PortPasswordDB; dbConf != nil {
+		if db, err = sql.Open(dbConf.Driver, dbConf.Dsn); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if dbConf.CheckInterval > 0 {
+			go func() {
+				for {
+					updatePasswd()
+					time.Sleep(time.Duration(dbConf.CheckInterval) * time.Second)
+				}
+			}()
+		}
+	}
 	if err = unifyPortPassword(config); err != nil {
 		os.Exit(1)
 	}
@@ -377,6 +474,8 @@ func main() {
 	for port, password := range config.PortPassword {
 		go run(port, password, config.Auth)
 	}
-
+	if config.MgrAddr != "" {
+		go runManager(config.MgrAddr)
+	}
 	waitSignal()
 }
